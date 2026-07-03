@@ -1,77 +1,81 @@
 // ============================================================
 //  Micro-service FISCAL — 2 endpoints pour le workflow n8n
-//  1) POST /pdf-to-images : PDF scanné  -> images base64 (par page)
+//  1) POST /pdf-to-images : PDF scanné -> images base64 (via pdftoppm/Poppler)
 //  2) POST /build-pdf     : JSON synthèse -> PDF français mis en forme
 // ============================================================
 
 const express = require("express");
 const multer = require("multer");
-const { fromBuffer } = require("pdf2pic");
 const PDFDocument = require("pdfkit");
+const { execFile } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-// upload en mémoire (pas d'écriture disque)
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 * 1024 * 1024 } });
 
-// petite clé d'API optionnelle (recommandé) : définie via variable d'env API_KEY
 function checkAuth(req, res, next) {
   const expected = process.env.API_KEY;
-  if (!expected) return next(); // pas de clé configurée -> ouvert
+  if (!expected) return next();
   const got = req.header("x-api-key");
   if (got !== expected) return res.status(401).json({ error: "unauthorized" });
   next();
 }
 
-// ---------- Health check ----------
 app.get("/", (_req, res) => res.json({ status: "ok", service: "fiscal-microservice" }));
 
-// ============================================================
-//  1) PDF -> IMAGES
-//  Reçoit un fichier "file" (multipart/form-data)
-//  Renvoie { images: [ { page, b64 } ] }
-// ============================================================
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 1024 * 1024 * 200 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(cmd + " failed: " + (stderr || err.message)));
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+// ---------- 1) PDF -> IMAGES (pdftoppm) ----------
 app.post("/pdf-to-images", checkAuth, upload.single("file"), async (req, res) => {
+  const workId = crypto.randomBytes(8).toString("hex");
+  const workDir = path.join(os.tmpdir(), "pdf_" + workId);
+  const inputPdf = path.join(workDir, "input.pdf");
+  const outPrefix = path.join(workDir, "page");
   try {
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({ error: "no file received (champ 'file' attendu)" });
     }
+    fs.mkdirSync(workDir, { recursive: true });
+    fs.writeFileSync(inputPdf, req.file.buffer);
 
-    const convert = fromBuffer(req.file.buffer, {
-      density: 150,           // DPI : 150 = bon compromis lisibilité / taille
-      format: "jpeg",
-      width: 1240,            // largeur de rendu (px)
-      preserveAspectRatio: true,
-    });
+    await run("pdftoppm", ["-jpeg", "-r", "150", inputPdf, outPrefix]);
 
-    // convertit toutes les pages, retourne du base64
-    const results = await convert.bulk(-1, { responseType: "base64" });
+    const files = fs.readdirSync(workDir)
+      .filter((f) => f.startsWith("page") && f.endsWith(".jpg"))
+      .sort((a, b) => (parseInt(a.replace(/\D/g, ""), 10) || 0) - (parseInt(b.replace(/\D/g, ""), 10) || 0));
 
-    const images = results
-      .filter((r) => r && r.base64)
-      .map((r, i) => ({ page: r.page || i + 1, b64: r.base64 }));
-
-    if (images.length === 0) {
+    if (files.length === 0) {
       return res.status(422).json({ error: "aucune page convertie" });
     }
-
+    const images = files.map((f, i) => ({
+      page: i + 1,
+      b64: fs.readFileSync(path.join(workDir, f)).toString("base64"),
+    }));
     return res.json({ pages: images.length, images });
   } catch (err) {
     console.error("pdf-to-images error:", err);
     return res.status(500).json({ error: "conversion_failed", detail: String(err.message || err) });
+  } finally {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (_e) {}
   }
 });
 
-// ============================================================
-//  2) BUILD PDF
-//  Reçoit { synthese: {...} } (le JSON produit par GPT)
-//  Renvoie directement le PDF (application/pdf) en binaire
-// ============================================================
+// ---------- 2) BUILD PDF (pdfkit) ----------
 app.post("/build-pdf", checkAuth, (req, res) => {
   try {
     const s = (req.body && req.body.synthese) || {};
-
     const doc = new PDFDocument({ size: "A4", margin: 48 });
     const chunks = [];
     doc.on("data", (c) => chunks.push(c));
@@ -82,12 +86,7 @@ app.post("/build-pdf", checkAuth, (req, res) => {
       res.send(pdf);
     });
 
-    // ---- Palette ----
-    const DARK = "#2E2E38";
-    const YELLOW = "#C9A400";
-    const GREY = "#595965";
-
-    // ---- Helpers ----
+    const DARK = "#2E2E38", YELLOW = "#C9A400", GREY = "#595965";
     const H = (t) => {
       doc.moveDown(0.6);
       doc.fillColor(DARK).font("Helvetica-Bold").fontSize(13).text(t);
@@ -96,58 +95,47 @@ app.post("/build-pdf", checkAuth, (req, res) => {
       doc.moveDown(0.4);
     };
     const sub = (t) => { doc.moveDown(0.35); doc.fillColor(DARK).font("Helvetica-Bold").fontSize(11).text(t); doc.moveDown(0.15); };
-    const bullet = (t) => doc.fillColor("#333333").font("Helvetica").fontSize(10).text("•  " + t, { indent: 8, lineGap: 1 });
-    const kv = (k, v) => {
-      doc.font("Helvetica-Bold").fontSize(10).fillColor(DARK).text(k + " ", { continued: true });
-      doc.font("Helvetica").fillColor("#333333").text(v || "—");
-    };
+    const bullet = (t) => doc.fillColor("#333333").font("Helvetica").fontSize(10).text("\u2022  " + t, { indent: 8, lineGap: 1 });
 
-    // ---- Titre ----
-    doc.fillColor(DARK).font("Helvetica-Bold").fontSize(20).text("Synthèse du redressement fiscal");
+    doc.fillColor(DARK).font("Helvetica-Bold").fontSize(20).text("Synth\u00e8se du redressement fiscal");
     if (s.societe) doc.fillColor(YELLOW).font("Helvetica-Bold").fontSize(13).text(s.societe);
     doc.moveDown(0.2);
     doc.fillColor(GREY).font("Helvetica").fontSize(9);
     const meta = [];
     if (s.matricule_fiscal) meta.push("Matricule fiscal : " + s.matricule_fiscal);
-    if (s.reference_redressement) meta.push("Réf. : " + s.reference_redressement);
-    if (meta.length) doc.text(meta.join("   •   "));
+    if (s.reference_redressement) meta.push("R\u00e9f. : " + s.reference_redressement);
+    if (meta.length) doc.text(meta.join("   \u2022   "));
 
-    // ---- Méta ----
-    H("Période vérifiée");
-    bullet(s.periode_verifiee || "—");
+    H("P\u00e9riode v\u00e9rifi\u00e9e");
+    bullet(s.periode_verifiee || "\u2014");
 
     H("Montant total du redressement");
-    doc.fillColor(DARK).font("Helvetica-Bold").fontSize(13).text(s.montant_total_redressement || "—");
+    doc.fillColor(DARK).font("Helvetica-Bold").fontSize(13).text(s.montant_total_redressement || "\u2014");
 
     if (Array.isArray(s.impots_concernes) && s.impots_concernes.length) {
-      H("Impôts et taxes concernés");
+      H("Imp\u00f4ts et taxes concern\u00e9s");
       s.impots_concernes.forEach((i) => bullet(i));
     }
 
-    // ---- Chefs de redressement ----
     H("Principaux chefs de redressement");
     const chefs = Array.isArray(s.chefs_redressement) ? s.chefs_redressement : [];
     chefs.forEach((c, idx) => {
-      sub(`${idx + 1}. ${c.impot || "Chef de redressement"}`);
-
+      sub((idx + 1) + ". " + (c.impot || "Chef de redressement"));
       if (Array.isArray(c.motifs) && c.motifs.length) {
         doc.font("Helvetica-Bold").fontSize(10).fillColor(DARK).text("Modifications / motifs :");
         c.motifs.forEach((m) => bullet(m));
       }
-
       if (Array.isArray(c.articles_appliques) && c.articles_appliques.length) {
         doc.moveDown(0.15);
-        doc.font("Helvetica-Bold").fontSize(10).fillColor(DARK).text("Articles appliqués :");
+        doc.font("Helvetica-Bold").fontSize(10).fillColor(DARK).text("Articles appliqu\u00e9s :");
         c.articles_appliques.forEach((a) => {
-          doc.font("Helvetica-Bold").fontSize(10).fillColor(DARK).text("•  " + (a.article || ""), { indent: 8, continued: true });
-          doc.font("Helvetica").fillColor(GREY).text("  —  " + (a.source || ""));
+          doc.font("Helvetica-Bold").fontSize(10).fillColor(DARK).text("\u2022  " + (a.article || ""), { indent: 8, continued: true });
+          doc.font("Helvetica").fillColor(GREY).text("  \u2014  " + (a.source || ""));
         });
       }
-
       if (Array.isArray(c.montants_par_annee) && c.montants_par_annee.length) {
         doc.moveDown(0.2);
         doc.font("Helvetica-Bold").fontSize(10).fillColor(DARK).text("Montants par exercice :");
-        // table simple
         const rows = c.montants_par_annee;
         const startX = 56, colW = 120;
         let x = startX, y = doc.y + 4;
@@ -157,9 +145,7 @@ app.post("/build-pdf", checkAuth, (req, res) => {
           x += colW;
           if (x + colW > 547) { x = startX; y += 40; }
         });
-        x = startX; y += 20;
-        // deuxième ligne : montants (réaligne sous les années)
-        let x2 = startX, y2 = y;
+        let x2 = startX, y2 = y + 20;
         rows.forEach((r) => {
           doc.rect(x2, y2, colW, 20).fillAndStroke("#F2F2F4", "#DDDDDD");
           doc.fillColor("#2E2E38").font("Helvetica").fontSize(9).text(r.montant || "", x2 + 6, y2 + 6, { width: colW - 12 });
@@ -179,4 +165,4 @@ app.post("/build-pdf", checkAuth, (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Micro-service en écoute sur le port ${PORT}`));
+app.listen(PORT, () => console.log("Micro-service en \u00e9coute sur le port " + PORT));

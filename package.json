@@ -1,7 +1,7 @@
 {
   "name": "fiscal-microservice",
-  "version": "1.0.0",
-  "description": "Micro-service pour le workflow n8n : PDF scanné -> images, et JSON -> PDF de synthèse.",
+  "version": "1.1.0",
+  "description": "Micro-service pour le workflow n8n : PDF scanné -> images (pdftoppm), et JSON -> PDF de synthèse.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,7 +12,6 @@
   "dependencies": {
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
-    "pdf2pic": "^3.1.3",
     "pdfkit": "^0.15.0"
   }
 }

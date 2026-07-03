@@ -1,10 +1,9 @@
-# Alternative au buildpack Nixpacks : plus fiable pour GraphicsMagick + Ghostscript.
-# Railway détecte automatiquement ce Dockerfile s'il est présent.
+# Image Node avec les outils Poppler (pdftoppm) + Ghostscript pour la conversion PDF.
 FROM node:20-slim
 
-# Dépendances système requises par pdf2pic
+# poppler-utils fournit pdftoppm ; ghostscript aide au rendu de certains PDF.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    graphicsmagick \
+    poppler-utils \
     ghostscript \
     && rm -rf /var/lib/apt/lists/*
 
